@@ -1,0 +1,21 @@
+# Copyright and license annotations for files that do not carry inline SPDX
+# headers (manifests, lockfiles, deployment units, configurations, and docs).
+# Hand-written source files carry their own SPDX lines; both are verified in
+# CI by `tools/check-spdx.sh` and `reuse lint` (REUSE 3.3).
+version = 1
+
+# Everything not listed below: the servers, Cloudflare Workers, and deployment
+# units are licensed under AGPL-3.0-or-later.
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 The TotalDrop Contributors"
+SPDX-License-Identifier = "AGPL-3.0-or-later"
+
+# Shared wire-protocol library (`totaldrop-proto`): dual-licensed under
+# MIT OR Apache-2.0.
+[[annotations]]
+path = "crates/totaldrop-proto/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 The TotalDrop Contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"

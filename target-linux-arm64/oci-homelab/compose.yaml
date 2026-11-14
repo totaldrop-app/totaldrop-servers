@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Hardened OCI Compose stack for Raspberry Pi 5, ARM64 NAS (Synology ARM64,
+# Rockchip RK3588), and ARM64 Homelab hosts.
+#
+# Usage:
+#   RENDEZVOUS_HOST=rendezvous.example.org RELAY_HOST=relay.example.org \
+#     docker compose -f target-linux-arm64/oci-homelab/compose.yaml up -d --build
+
+name: totaldrop-servers-arm64
+
+services:
+  rendezvous:
+    build:
+      context: ../..
+      dockerfile: target-linux-arm64/oci-homelab/Containerfile
+      target: rendezvous
+    image: totaldrop-rendezvous:arm64
+    platform: linux/arm64
+    command: ["0.0.0.0:4000"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 192m
+    restart: unless-stopped
+    networks:
+      - internal
+
+  relay:
+    build:
+      context: ../..
+      dockerfile: target-linux-arm64/oci-homelab/Containerfile
+      target: relay
+    image: totaldrop-relay:arm64
+    platform: linux/arm64
+    command: ["0.0.0.0:4100", "0.0.0.0:4430"]
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 384m
+    ports:
+      # Address discovery probes the relay's public UDP 443 port; mapping host
+      # 443/udp to unprivileged 4430/udp avoids granting CAP_NET_BIND_SERVICE.
+      - "443:4430/udp"
+    restart: unless-stopped
+    networks:
+      - internal
+
+  caddy:
+    image: docker.io/library/caddy:2.9-alpine
+    platform: linux/arm64
+    environment:
+      RENDEZVOUS_HOST: "${RENDEZVOUS_HOST:-rendezvous.localhost}"
+      RELAY_HOST: "${RELAY_HOST:-relay.localhost}"
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - rendezvous
+      - relay
+    restart: unless-stopped
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Reverse proxy configuration for x86_64 / ARM64 Homelab self-hosting.
+# Set RENDEZVOUS_HOST and RELAY_HOST in your environment or .env file.
+{
+	# UDP 443 is mapped directly to totaldrop-relay for address discovery,
+	# so Caddy serves HTTP/1.1 and HTTP/2 over TCP 443 only.
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$RENDEZVOUS_HOST:rendezvous.localhost} {
+	@ws path /v0/allocate /v0/mailbox/*
+	handle @ws {
+		reverse_proxy rendezvous:4000
+	}
+	handle {
+		respond "TotalDrop rendezvous server" 200
+	}
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		-Server
+	}
+}
+
+{$RELAY_HOST:relay.localhost} {
+	@relay path /v0/relay /v0/relay/*
+	handle @relay {
+		reverse_proxy relay:4100
+	}
+	handle {
+		respond "TotalDrop relay" 200
+	}
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		-Server
+	}
+}

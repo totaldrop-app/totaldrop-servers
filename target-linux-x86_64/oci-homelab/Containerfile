@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Multi-stage static OCI Containerfile for x86_64 Homelab / NAS (Synology DSM,
+# Unraid, TrueNAS SCALE, Proxmox). Build from the totaldrop-servers repository root:
+#
+#   docker build -f target-linux-x86_64/oci-homelab/Containerfile --target rendezvous -t totaldrop-rendezvous:amd64 .
+#   docker build -f target-linux-x86_64/oci-homelab/Containerfile --target relay -t totaldrop-relay:amd64 .
+#   docker build -f target-linux-x86_64/oci-homelab/Containerfile -t totaldrop-servers:amd64 .
+
+FROM --platform=linux/amd64 docker.io/library/rust:1.99-slim-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools clang make ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY rust-shared ./rust-shared
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+RUN cargo build --release --locked \
+    --target x86_64-unknown-linux-musl \
+    -p totaldrop-rendezvous \
+    -p totaldrop-relay
+
+# Minimal scratch image for totaldrop-rendezvous (static musl binary, non-root)
+FROM scratch AS rendezvous
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/totaldrop-rendezvous /totaldrop-rendezvous
+COPY LICENSES/AGPL-3.0-or-later.txt /LICENSES/AGPL-3.0-or-later.txt
+USER 65532:65532
+EXPOSE 4000/tcp
+ENTRYPOINT ["/totaldrop-rendezvous"]
+CMD ["0.0.0.0:4000"]
+
+# Minimal scratch image for totaldrop-relay (static musl binary, non-root)
+FROM scratch AS relay
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/totaldrop-relay /totaldrop-relay
+COPY LICENSES/AGPL-3.0-or-later.txt /LICENSES/AGPL-3.0-or-later.txt
+USER 65532:65532
+EXPOSE 4100/tcp 4430/udp
+ENTRYPOINT ["/totaldrop-relay"]
+CMD ["0.0.0.0:4100", "0.0.0.0:4430"]
+
+# Combined distroless static image with both server binaries
+FROM --platform=linux/amd64 gcr.io/distroless/static-debian12:nonroot AS runtime
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/totaldrop-rendezvous /usr/local/bin/totaldrop-rendezvous
+COPY --from=builder /src/target/x86_64-unknown-linux-musl/release/totaldrop-relay /usr/local/bin/totaldrop-relay
+COPY LICENSES/AGPL-3.0-or-later.txt /LICENSES/AGPL-3.0-or-later.txt
+USER 65532:65532
+EXPOSE 4000/tcp 4100/tcp 4430/udp
+ENTRYPOINT ["/usr/local/bin/totaldrop-rendezvous"]
+CMD ["0.0.0.0:4000"]

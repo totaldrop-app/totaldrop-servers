@@ -1,0 +1,671 @@
+// SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+//! The TotalDrop relay (spec section 6).
+//!
+//! It does two jobs, both described in [`totaldrop_proto::relay`]:
+//!
+//! - **address discovery**: a STUN responder (Binding requests only) that
+//!   tells a device the address and port it saw, for relays that are run
+//!   without a separate STUN server;
+//! - **forwarding** on WebSocket: devices sign in with a single-use endpoint
+//!   key, and the relay passes QUIC datagrams between keys.
+//!
+//! What crosses the relay is already encrypted end to end. The relay keeps
+//! nothing on disk and logs nothing about clients: no addresses, no keys, no
+//! traffic. Each connection is capped in rate, total bytes and lifetime.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
+use tokio::time::Instant;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use totaldrop_proto::relay as wire;
+
+/// The WebSocket path of forwarding.
+pub const PATH: &str = "/v0/relay";
+
+/// How long the WebSocket handshake, signing in and every write may take.
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Limits. The defaults suit one small server.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Devices connected at once.
+    pub max_clients: usize,
+    /// Bytes per second one device may send through the relay.
+    pub rate: u64,
+    /// Bytes one connection may send in total.
+    pub session_bytes: u64,
+    /// How long one connection may last.
+    pub session_time: Duration,
+    /// A connection that sends no datagram for this long is closed; pings do
+    /// not count.
+    pub idle: Duration,
+    /// Datagrams queued for one device before more are dropped.
+    pub queue: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_clients: 2_000,
+            rate: 8 * 1024 * 1024,
+            session_bytes: 32 * 1024 * 1024 * 1024,
+            session_time: Duration::from_secs(6 * 60 * 60),
+            idle: Duration::from_secs(60),
+            queue: 1_024,
+        }
+    }
+}
+
+type Outbox = mpsc::Sender<Vec<u8>>;
+
+/// The two endpoint keys a pair path names.
+type Pair = ([u8; 32], [u8; 32]);
+
+/// One signed-in connection.
+#[derive(Debug)]
+struct Client {
+    /// Connection number, so a connection removes only its own entry.
+    id: u64,
+    /// The pair it signed in on: a datagram reaches a key only on the same
+    /// pair.
+    pair: Pair,
+    outbox: Outbox,
+    /// Ends the connection: it was replaced, or the other side left.
+    end: Arc<Notify>,
+}
+
+/// Signed-in devices by endpoint key.
+type Clients = HashMap<[u8; 32], Client>;
+
+/// A running relay.
+#[derive(Debug, Clone)]
+pub struct Relay {
+    clients: Arc<Mutex<Clients>>,
+    next: Arc<std::sync::atomic::AtomicU64>,
+    accepted: Arc<std::sync::atomic::AtomicU64>,
+    forwarded: Arc<std::sync::atomic::AtomicU64>,
+    slots: Arc<Semaphore>,
+    config: Arc<Config>,
+}
+
+impl Relay {
+    /// A relay with the given limits.
+    pub fn new(config: Config) -> Self {
+        Self {
+            clients: Arc::default(),
+            next: Arc::default(),
+            accepted: Arc::default(),
+            forwarded: Arc::default(),
+            slots: Arc::new(Semaphore::new(config.max_clients)),
+            config: Arc::new(config),
+        }
+    }
+
+    /// Devices signed in right now, for tests and health checks.
+    pub async fn client_count(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
+    /// TCP connections accepted since start: one total, for tests.
+    pub fn connections_accepted(&self) -> u64 {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes of datagrams forwarded since start: one total, nothing per
+    /// client, for tests and health checks.
+    pub fn forwarded_bytes(&self) -> u64 {
+        self.forwarded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Answer STUN Binding requests on `socket` until the task is dropped.
+    pub async fn discovery(socket: UdpSocket) {
+        let mut buf = [0u8; 548];
+        loop {
+            let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                continue;
+            };
+            if let Some(id) = buf.get(..n).and_then(wire::parse_stun_request) {
+                let _ = socket.send_to(&wire::stun_response(&id, from), from).await;
+            }
+        }
+    }
+
+    /// Accept WebSocket connections on `listener` until the task is dropped.
+    pub async fn serve(self, listener: TcpListener) {
+        loop {
+            let Ok((stream, _addr)) = listener.accept().await else {
+                continue;
+            };
+            self.accepted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Ok(permit) = self.slots.clone().try_acquire_owned() else {
+                // Over capacity: drop the connection without reading it.
+                drop(stream);
+                continue;
+            };
+            let relay = self.clone();
+            tokio::spawn(async move {
+                relay.handle(stream).await;
+                drop(permit);
+            });
+        }
+    }
+
+    // The handshake callback's error type is fixed by tungstenite.
+    #[allow(clippy::result_large_err)]
+    async fn handle(&self, stream: TcpStream) {
+        let _ = stream.set_nodelay(true);
+        let mut ws_config = WebSocketConfig::default();
+        ws_config.max_message_size = Some(wire::MAX_MESSAGE);
+        ws_config.max_frame_size = Some(wire::MAX_MESSAGE);
+        let mut path = String::new();
+        let callback = |req: &Request, resp: Response| {
+            path = req.uri().path().to_owned();
+            refuse_browsers(req, resp)
+        };
+        let Ok(Ok(mut ws)) = tokio::time::timeout(
+            IO_TIMEOUT,
+            tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
+        )
+        .await
+        else {
+            return;
+        };
+        // `/v0/relay/<pair>` names the only two keys that may sign in here,
+        // and the only two that datagrams may pass between (as on the
+        // Cloudflare relay). Any other path is refused.
+        let Some(pair) = path
+            .strip_prefix(PATH)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(wire::parse_pair_name)
+        else {
+            return;
+        };
+
+        // Sign in: the device proves it holds the endpoint key it claims.
+        let mut challenge = [0u8; 32];
+        if getrandom::fill(&mut challenge).is_err() {
+            return;
+        }
+        let key = tokio::time::timeout(IO_TIMEOUT, async {
+            ws.send(Message::Binary(wire::challenge(&challenge).into()))
+                .await
+                .ok()?;
+            let hello = match ws.next().await {
+                Some(Ok(Message::Binary(b))) => wire::parse_hello(&b)?,
+                _ => return None,
+            };
+            let (key, signature) = hello;
+            if key != pair.0 && key != pair.1 {
+                return None;
+            }
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+                .verify(&wire::signed_bytes(&challenge), &signature)
+                .ok()?;
+            Some(key)
+        })
+        .await;
+        let Ok(Some(key)) = key else { return };
+        let other = if key == pair.0 { pair.1 } else { pair.0 };
+
+        let (outbox, mut inbox) = mpsc::channel::<Vec<u8>>(self.config.queue);
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let end = Arc::new(Notify::new());
+        {
+            let mut clients = self.clients.lock().await;
+            match clients.get(&key) {
+                // One pair per key: keys are single-use, so a key on a
+                // second pair is a bug or a key reused on purpose. (The
+                // Cloudflare relay has one object per pair and cannot see
+                // this.)
+                Some(old) if old.pair != pair => return,
+                // The holder of the key signed in again on its pair: its old
+                // socket died without this relay noticing (a Wi-Fi switch,
+                // NAT rebinding). The new one takes over at once, before
+                // QUIC gives up (#190). Only the key's holder can sign in.
+                Some(old) => old.end.notify_one(),
+                None => {}
+            }
+            clients.insert(
+                key,
+                Client {
+                    id,
+                    pair,
+                    outbox,
+                    end: end.clone(),
+                },
+            );
+        }
+        if !matches!(
+            tokio::time::timeout(IO_TIMEOUT, ws.send(Message::Binary(wire::ok().into()))).await,
+            Ok(Ok(()))
+        ) {
+            self.leave(&key, id).await;
+            return;
+        }
+
+        let (mut sink, mut source) = ws.split();
+        let writer = tokio::spawn(async move {
+            while let Some(frame) = inbox.recv().await {
+                let sent =
+                    tokio::time::timeout(IO_TIMEOUT, sink.send(Message::Binary(frame.into())))
+                        .await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    break;
+                }
+            }
+            let _ = tokio::time::timeout(IO_TIMEOUT, sink.close()).await;
+        });
+
+        let started = Instant::now();
+        // Idle time counts from the last datagram: pings keep TCP alive but
+        // do not keep a connection that carries nothing.
+        let mut last_data = started;
+        let mut budget = Budget::new(self.config.rate);
+        let mut total: u64 = 0;
+        loop {
+            if started.elapsed() > self.config.session_time || writer.is_finished() {
+                break;
+            }
+            let Some(wait) = self
+                .config
+                .idle
+                .checked_sub(last_data.elapsed())
+                .filter(|w| !w.is_zero())
+            else {
+                break;
+            };
+            let next = tokio::select! {
+                () = end.notified() => break,
+                next = tokio::time::timeout(wait, source.next()) => match next {
+                    Ok(Some(Ok(m))) => m,
+                    _ => break,
+                },
+            };
+            let frame = match next {
+                Message::Binary(b) => b,
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => break,
+            };
+            let Some((to, datagrams)) = wire::parse_frame(&frame) else {
+                break;
+            };
+            // Only the other key of this pair is a destination.
+            if to != other {
+                break;
+            }
+            last_data = Instant::now();
+            let payload: usize = datagrams.iter().map(|d| d.len()).sum();
+            let size = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+            total = total.saturating_add(size);
+            if total > self.config.session_bytes {
+                break;
+            }
+            // Slow the sender down instead of dropping: TCP pushes back.
+            budget.spend(size).await;
+            // The target must have signed in on this same pair: a key that is
+            // part of two pairs is reachable only from the one it chose.
+            let target = self
+                .clients
+                .lock()
+                .await
+                .get(&to)
+                .filter(|c| c.pair == pair)
+                .map(|c| c.outbox.clone());
+            if let Some(target) = target {
+                // A full queue drops, like a busy network; QUIC recovers.
+                // Same message with the source key in place of the target's.
+                let mut out = frame.to_vec();
+                if let Some(head) = out.get_mut(..32) {
+                    head.copy_from_slice(&key);
+                }
+                if target.try_send(out).is_ok() {
+                    let n = u64::try_from(payload).unwrap_or(0);
+                    self.forwarded
+                        .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        writer.abort();
+        self.leave(&key, id).await;
+    }
+
+    /// Remove the connection `id` of `key`. When it was still the key's
+    /// connection (not replaced), the transfer is over, however it ended:
+    /// the other signed-in side of its pair is ended too, as on the
+    /// Cloudflare relay (protocol notes, item 20).
+    async fn leave(&self, key: &[u8; 32], id: u64) {
+        let mut clients = self.clients.lock().await;
+        if !clients.get(key).is_some_and(|c| c.id == id) {
+            return;
+        }
+        let Some(gone) = clients.remove(key) else {
+            return;
+        };
+        let other = if *key == gone.pair.0 {
+            gone.pair.1
+        } else {
+            gone.pair.0
+        };
+        if let Some(peer) = clients.get(&other).filter(|c| c.pair == gone.pair) {
+            peer.end.notify_one();
+        }
+    }
+}
+
+/// A token bucket holding at most one second of traffic.
+struct Budget {
+    rate: u64,
+    tokens: u64,
+    last: Instant,
+}
+
+impl Budget {
+    fn new(rate: u64) -> Self {
+        Self {
+            rate: rate.max(1),
+            tokens: rate,
+            last: Instant::now(),
+        }
+    }
+
+    async fn spend(&mut self, n: u64) {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.last);
+        self.last = now;
+        let refill = u64::try_from(
+            elapsed
+                .as_micros()
+                .saturating_mul(u128::from(self.rate))
+                .checked_div(1_000_000)
+                .unwrap_or(0),
+        )
+        .unwrap_or(u64::MAX);
+        self.tokens = self.tokens.saturating_add(refill).min(self.rate);
+        if self.tokens >= n {
+            self.tokens = self.tokens.saturating_sub(n);
+            return;
+        }
+        let missing = n.saturating_sub(self.tokens);
+        self.tokens = 0;
+        let micros = missing
+            .saturating_mul(1_000_000)
+            .checked_div(self.rate)
+            .unwrap_or(0);
+        tokio::time::sleep(Duration::from_micros(micros)).await;
+        self.last = Instant::now();
+    }
+}
+
+/// Serve WebSocket forwarding on `ws` and discovery on `udp`. Returns the
+/// bound addresses, the relay and its task.
+pub async fn spawn(
+    ws: SocketAddr,
+    udp: SocketAddr,
+    config: Config,
+) -> std::io::Result<(SocketAddr, SocketAddr, Relay, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind(ws).await?;
+    let socket = UdpSocket::bind(udp).await?;
+    let (ws, udp) = (listener.local_addr()?, socket.local_addr()?);
+    let relay = Relay::new(config);
+    let serving = relay.clone();
+    let task = tokio::spawn(async move {
+        tokio::join!(serving.serve(listener), Relay::discovery(socket));
+    });
+    Ok((ws, udp, relay, task))
+}
+
+/// For tests: forwarding on `ws://127.0.0.1:<port>/v0/relay` (clients add
+/// `/<key A>-<key B>`) and STUN on UDP `127.0.0.1:<other port>`. Returns
+/// both, the relay and its task.
+///
+/// Each gets its own free port from the system. Taking the TCP port's
+/// number for UDP as well kept failing on Windows runners (#320): a port
+/// free for one protocol need not be free for the other.
+pub async fn spawn_local(
+    config: Config,
+) -> std::io::Result<(String, String, Relay, tokio::task::JoinHandle<()>)> {
+    let any = SocketAddr::from(([127, 0, 0, 1], 0));
+    let (ws, udp, relay, task) = spawn(any, any, config).await?;
+    Ok((format!("ws://{ws}{PATH}"), udp.to_string(), relay, task))
+}
+
+/// #450: a WebSocket opened by a web page always carries `Origin`; the
+/// apps and the command line never send it. Refusing those keeps a page
+/// from opening connections from its visitors' browsers.
+#[allow(clippy::result_large_err)] // the type tungstenite asks for
+fn refuse_browsers(req: &Request, resp: Response) -> Result<Response, ErrorResponse> {
+    if req.headers().contains_key("origin") {
+        let mut refused = ErrorResponse::new(Some("browsers are not served\n".to_owned()));
+        *refused.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+        return Err(refused);
+    }
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    #[tokio::test]
+    async fn discovery_answers_with_the_seen_address() {
+        let (_url, stun, _relay, _task) = spawn_local(Config::default()).await.unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let nonce = [5u8; 12];
+        client
+            .send_to(&wire::stun_request(&nonce), stun.as_str())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 128];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let seen = wire::parse_stun_response(&buf[..n], &nonce).unwrap();
+        assert_eq!(seen, client.local_addr().unwrap());
+        // Garbage gets no answer.
+        client.send_to(b"hello", stun.as_str()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+    }
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    fn keypair() -> (ring::signature::Ed25519KeyPair, [u8; 32]) {
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public: [u8; 32] = kp.public_key().as_ref().try_into().unwrap();
+        (kp, public)
+    }
+
+    /// Connect to `url` and sign in with `kp`; `None` when the relay refuses.
+    async fn sign_in(
+        url: &str,
+        kp: &ring::signature::Ed25519KeyPair,
+        public: &[u8; 32],
+    ) -> Option<Ws> {
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.ok()?;
+        let challenge = match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) => wire::parse_challenge(&b)?,
+            _ => return None,
+        };
+        let sig: [u8; 64] = kp
+            .sign(&wire::signed_bytes(&challenge))
+            .as_ref()
+            .try_into()
+            .ok()?;
+        ws.send(Message::Binary(wire::hello(public, &sig).into()))
+            .await
+            .ok()?;
+        match tokio::time::timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) if wire::is_ok(&b) => Some(ws),
+            _ => None,
+        }
+    }
+
+    /// The next datagram frame on `ws` within `wait`, skipping pings.
+    async fn next_frame(ws: &mut Ws, wait: Duration) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now().checked_add(wait).unwrap();
+        loop {
+            match tokio::time::timeout_at(deadline, ws.next()).await {
+                Ok(Some(Ok(Message::Binary(b)))) => return Some(b.to_vec()),
+                Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// Whether the relay closed `ws` within `wait`.
+    async fn closed(ws: &mut Ws, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now().checked_add(wait).unwrap();
+        loop {
+            match tokio::time::timeout_at(deadline, ws.next()).await {
+                Err(_) => return false,
+                Ok(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return true,
+                Ok(Some(Ok(_))) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_path_is_refused() {
+        let (url, _stun, _relay, _task) = spawn_local(Config::default()).await.unwrap();
+        let (kp, public) = keypair();
+        assert!(sign_in(&url, &kp, &public).await.is_none());
+    }
+
+    /// A device can reach only the other key of its own pair; trying another
+    /// pair's key ends its connection and delivers nothing.
+    #[tokio::test]
+    async fn forwards_only_within_the_pair() {
+        let (url, _stun, relay, _task) = spawn_local(Config::default()).await.unwrap();
+        let (ka, a) = keypair();
+        let (kb, b) = keypair();
+        let (kc, c) = keypair();
+        let (kd, d) = keypair();
+        let ab = format!("{url}/{}", wire::pair_name(&a, &b));
+        let cd = format!("{url}/{}", wire::pair_name(&c, &d));
+        let mut wa = sign_in(&ab, &ka, &a).await.unwrap();
+        let mut wb = sign_in(&ab, &kb, &b).await.unwrap();
+        let mut wc = sign_in(&cd, &kc, &c).await.unwrap();
+        let _wd = sign_in(&cd, &kd, &d).await.unwrap();
+
+        // C, signed in on the C–D pair, aims at A.
+        wc.send(Message::Binary(wire::frame(&a, b"injected").into()))
+            .await
+            .unwrap();
+        assert!(closed(&mut wc, Duration::from_secs(2)).await);
+        assert!(
+            next_frame(&mut wa, Duration::from_millis(300))
+                .await
+                .is_none()
+        );
+        assert_eq!(relay.forwarded_bytes(), 0);
+
+        // Within the pair it works.
+        wb.send(Message::Binary(wire::frame(&a, b"hello").into()))
+            .await
+            .unwrap();
+        let got = next_frame(&mut wa, Duration::from_secs(2)).await.unwrap();
+        let (from, datagrams) = wire::parse_frame(&got).unwrap();
+        assert_eq!(from, b);
+        assert_eq!(datagrams, vec![&b"hello"[..]]);
+    }
+
+    /// A key in two pairs is reachable only on the pair it signed in on: C,
+    /// on its own pair with A, cannot reach A, who is on the A–B pair.
+    #[tokio::test]
+    async fn a_shared_key_is_reachable_only_on_its_own_pair() {
+        let (url, _stun, relay, _task) = spawn_local(Config::default()).await.unwrap();
+        let (ka, a) = keypair();
+        let (_kb, b) = keypair();
+        let (kc, c) = keypair();
+        let mut wa = sign_in(&format!("{url}/{}", wire::pair_name(&a, &b)), &ka, &a)
+            .await
+            .unwrap();
+        let mut wc = sign_in(&format!("{url}/{}", wire::pair_name(&a, &c)), &kc, &c)
+            .await
+            .unwrap();
+        wc.send(Message::Binary(wire::frame(&a, b"flood").into()))
+            .await
+            .unwrap();
+        assert!(
+            next_frame(&mut wa, Duration::from_millis(400))
+                .await
+                .is_none()
+        );
+        assert_eq!(relay.forwarded_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_outside_the_pair_cannot_sign_in() {
+        let (url, _stun, _relay, _task) = spawn_local(Config::default()).await.unwrap();
+        let (_ka, a) = keypair();
+        let (_kb, b) = keypair();
+        let (kc, c) = keypair();
+        let ab = format!("{url}/{}", wire::pair_name(&a, &b));
+        assert!(sign_in(&ab, &kc, &c).await.is_none());
+    }
+
+    /// Pings do not keep a connection that carries no datagrams.
+    #[tokio::test]
+    async fn pings_do_not_keep_an_idle_connection() {
+        let config = Config {
+            idle: Duration::from_millis(400),
+            ..Config::default()
+        };
+        let (url, _stun, _relay, _task) = spawn_local(config).await.unwrap();
+        let (ka, a) = keypair();
+        let (_kb, b) = keypair();
+        let mut wa = sign_in(&format!("{url}/{}", wire::pair_name(&a, &b)), &ka, &a)
+            .await
+            .unwrap();
+        let start = Instant::now();
+        let mut was_closed = false;
+        while start.elapsed() < Duration::from_secs(3) {
+            if wa.send(Message::Ping(Vec::new().into())).await.is_err() {
+                was_closed = true;
+                break;
+            }
+            if closed(&mut wa, Duration::from_millis(100)).await {
+                was_closed = true;
+                break;
+            }
+        }
+        assert!(
+            was_closed,
+            "a ping-only connection must be closed when idle"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn budget_limits_the_rate() {
+        let mut b = Budget::new(100_000);
+        let start = Instant::now();
+        for _ in 0..30 {
+            b.spend(10_000).await;
+        }
+        // 300 KB at 100 KB/s with one second of burst: about two seconds.
+        assert!(start.elapsed() >= Duration::from_millis(1_800));
+    }
+}

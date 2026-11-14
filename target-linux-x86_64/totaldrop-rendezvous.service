@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 The TotalDrop Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[Unit]
+Description=TotalDrop rendezvous server (x86_64)
+Documentation=https://totaldrop.app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Listens on loopback behind a TLS 1.3 reverse proxy (such as Caddy).
+ExecStart=/usr/local/bin/totaldrop-rendezvous 127.0.0.1:4000
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=x86-64
+# Nothing about clients is logged; stderr only reports the listen address.
+LimitNOFILE=65536
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

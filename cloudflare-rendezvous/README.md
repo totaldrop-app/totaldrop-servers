@@ -1,0 +1,43 @@
+# TotalDrop rendezvous on Cloudflare Workers
+
+This is the production rendezvous server for `rendezvous.totaldrop.app`. It speaks exactly the same protocol as the Rust server in `../rust-shared/totaldrop-rendezvous`, and the same end-to-end tests run against both, in CI whenever a Worker, a Rust server or the client crates change (`.github/workflows/server.yml`). Against a Worker a few checks are weaker: byte counts are not read and STUN is not tried. Licensed AGPL-3.0-or-later.
+
+| Path | What it does |
+| --- | --- |
+| `/v0/allocate` | One `allocate` message, one `allocated` reply with the nameplate and an allocator token |
+| `/v0/mailbox/<n>` | `claim`, `add` and `close` for one mailbox |
+
+How it is built:
+
+- The Worker keeps no state and logs nothing. Observability is turned off in `wrangler.jsonc`.
+- A WebSocket that carries an `Origin` header, which every browser sends and the apps never do, gets 403 before anything is counted (#450), as on the Rust server.
+- One `Directory` Durable Object decides which nameplates are free, in use, retired after a failed code (24 hours), or resting before reuse (10 minutes). It never sees mailbox contents.
+- The `Directory` also limits each client (an IPv4 address or an IPv6 /64, from `CF-Connecting-IP`) to 60 allocations and mailbox openings at once and one more every second (`src/limit.ts`, the same rule as the Rust server's). The counters are in its memory only, under a randomly keyed hash, and are never written to storage. While any client is counted the Directory's minute alarm stays set (`src/alarm.ts`), so a counter is forgotten within about two minutes of its client's last request even when no code is in use. `wrangler dev --var RATE_BURST:<n> --var RATE_INTERVAL_MS:<ms>` changes the limit for tests; production sets neither.
+- Each mailbox is its own `Mailbox` Durable Object, named by its random 16-byte mailbox ID. It holds at most two sides and briefly buffers messages for a side that has not arrived yet. It erases all of its storage when both sides have left, or when it expires (15 minutes unclaimed, one hour at most).
+
+## Develop and test
+
+```bash
+npm ci
+npm run check                      # type check
+npx wrangler dev --local --port 8799
+# in another terminal, from the repository root:
+TOTALDROP_TEST_SERVER=ws://127.0.0.1:8799 cargo test -p totaldrop-cli --test end_to_end
+```
+
+The suite opens many codes from one address, so for a full run start the Worker with a higher burst (`--var RATE_BURST:1000`). The rate-limit test runs against a second Worker with the test's own low limit, as CI does:
+
+```bash
+npx wrangler dev --local --port 8789 --inspector-port 9231 --persist-to /tmp/limited \
+  --var RATE_BURST:4 --var RATE_INTERVAL_MS:5000
+TOTALDROP_TEST_SERVER_LIMITED=ws://127.0.0.1:8789 cargo test -p totaldrop-cli --test end_to_end rate
+```
+
+## Deploy
+
+Deploys run from CI, from `main` only, after the owner approves them in the
+`cloudflare` environment (`.github/workflows/deploy.yml`). A health probe
+(`rust-shared/tools/probe.mjs rendezvous`) follows every deploy. Setup and
+self-hosting options are documented in [../README.md](../README.md).
+
+The route in `wrangler.jsonc` attaches the Worker to the custom domain `rendezvous.totaldrop.app`. Cloudflare creates the DNS record itself.
